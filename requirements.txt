@@ -6,3 +6,4 @@ openai
 requests
 python-pptx
 xlsxwriter
+openpyxl
