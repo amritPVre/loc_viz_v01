@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Regional Office Location Density Analysis
-with AI Recommendation + SWOT Visualization + PPT Export
+Created on Sat Aug 30 22:49:31 2025
+@author: amrit
 """
 
 import streamlit as st
@@ -13,8 +13,6 @@ import math
 from io import BytesIO
 import requests
 from openai import OpenAI
-from pptx import Presentation
-from pptx.util import Inches, Pt
 
 # ---------------- Page Config ----------------
 st.set_page_config(page_title="Regional Office Location Density Analysis", layout="wide")
@@ -45,6 +43,7 @@ def parse_coords(coord_str):
 # ---------------- APIs ----------------
 NOMINATIM_REVERSE = "https://nominatim.openstreetmap.org/reverse"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
 
 def reverse_geocode(lat, lon):
     try:
@@ -74,6 +73,19 @@ def overpass_nearest_rail_station(lat, lon, radius_m=30000):
     except: pass
     return {}
 
+def overpass_nearest_airport(lat, lon, radius_m=150000):
+    q=f"""[out:json][timeout:25];node(around:{radius_m},{lat},{lon})["aeroway"="aerodrome"];out body;"""
+    try:
+        r=requests.post(OVERPASS_URL,data={"data":q},timeout=30)
+        if r.ok:
+            data=r.json().get("elements",[])
+            if not data: return {}
+            best=min(data,key=lambda n:haversine(lat,lon,n["lat"],n["lon"]))
+            return {"name":best.get("tags",{}).get("name","Unnamed Aerodrome"),"lat":best["lat"],
+                    "lon":best["lon"],"distance_km":round(haversine(lat,lon,best["lat"],best["lon"]),2)}
+    except: pass
+    return {}
+
 def overpass_nearby_highways(lat, lon, radius_m=50000, limit=5):
     q = f"""
     [out:json][timeout:25];
@@ -94,6 +106,7 @@ def overpass_nearby_highways(lat, lon, radius_m=50000, limit=5):
                 if clat and clon:
                     d = haversine(lat, lon, clat, clon)
                     results.append({"NH Ref": ref, "Name": name, "Distance (km)": round(d, 2)})
+            # Sort and unique by NH Ref
             results.sort(key=lambda x: x["Distance (km)"])
             seen, unique = set(), []
             for r_ in results:
@@ -106,7 +119,68 @@ def overpass_nearby_highways(lat, lon, radius_m=50000, limit=5):
     except: pass
     return []
 
+def geonames_population(city, country="IN", username="amritpvre"):
+    if not city: return {}
+    try:
+        url=f"http://api.geonames.org/searchJSON?q={city}&country={country}&maxRows=1&username={username}"
+        r=requests.get(url,timeout=15)
+        if r.ok:
+            data=r.json().get("geonames",[])
+            if data:
+                entry=data[0]
+                return {"city":entry.get("name"),"country":entry.get("countryName"),
+                        "population":entry.get("population")}
+    except: pass
+    return {}
+
+def wikidata_population(city_label):
+    if not city_label: return {}
+    query=f"""
+    SELECT ?population ?pointInTime WHERE {{
+      ?city rdfs:label "{city_label}"@en.
+      ?city p:P1082 ?pop.
+      ?pop ps:P1082 ?population.
+      OPTIONAL {{ ?pop pq:P585 ?pointInTime. }}
+    }}
+    ORDER BY DESC(?pointInTime) LIMIT 1
+    """
+    try:
+        r=requests.get(WIKIDATA_SPARQL,params={"query":query,"format":"json"},
+                       headers={"User-Agent":"LocationDensityApp/1.0"},timeout=30)
+        if r.ok:
+            binds=r.json()["results"]["bindings"]
+            if binds:
+                b=binds[0]
+                pop=int(float(b["population"]["value"]))
+                as_of=b.get("pointInTime",{}).get("value","")
+                return {"city":city_label,"population":pop,"as_of":as_of}
+    except: pass
+    return {}
+
 # ---------------- AI Helpers ----------------
+def ai_recommendation(ranking_df, context):
+    if not client:
+        return "⚠️ AI not configured. Add your OpenRouter API key in Streamlit secrets."
+    prompt = f"""
+    You are an expert business analyst.
+
+    Office ranking by supplier density:
+    {ranking_df.to_string(index=False)}
+
+    Contextual info:
+    {context}
+
+    Please recommend the best regional office, with reasoning and tradeoffs.
+    """
+    try:
+        resp = client.chat.completions.create(
+            model="deepseek/deepseek-chat-v3.1:free",
+            messages=[{"role":"user","content":prompt}]
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        return f"AI error: {e}"
+
 def ai_swot_analysis(ranking_df, context, office_name):
     if not client:
         return "⚠️ AI not configured."
@@ -130,83 +204,6 @@ def ai_swot_analysis(ranking_df, context, office_name):
     except Exception as e:
         return f"AI error: {e}"
 
-def parse_swot(ai_text):
-    swot = {"Strengths": [], "Weaknesses": [], "Opportunities": [], "Threats": []}
-    current = None
-    for line in ai_text.splitlines():
-        line=line.strip()
-        if not line: continue
-        if line.lower().startswith("strength"):
-            current="Strengths"
-        elif line.lower().startswith("weakness"):
-            current="Weaknesses"
-        elif line.lower().startswith("opportun"):
-            current="Opportunities"
-        elif line.lower().startswith("threat"):
-            current="Threats"
-        elif current and (line.startswith("-") or line.startswith("•")):
-            swot[current].append(line.lstrip("-• ").strip())
-    return swot
-
-def show_swot(swot):
-    st.markdown("### 📊 SWOT Analysis (Visualized)")
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("#### ✅ Strengths")
-        for s in swot["Strengths"]:
-            st.markdown(f"- {s}")
-
-    with col2:
-        st.markdown("#### ⚠️ Weaknesses")
-        for w in swot["Weaknesses"]:
-            st.markdown(f"- {w}")
-
-    col3, col4 = st.columns(2)
-
-    with col3:
-        st.markdown("#### 🚀 Opportunities")
-        for o in swot["Opportunities"]:
-            st.markdown(f"- {o}")
-
-    with col4:
-        st.markdown("#### 🔥 Threats")
-        for t in swot["Threats"]:
-            st.markdown(f"- {t}")
-
-def export_swot_to_ppt(swot, office_name):
-    prs = Presentation()
-    slide = prs.slides.add_slide(prs.slide_layouts[5])  # Title only
-    title = slide.shapes.title
-    title.text = f"SWOT Analysis — {office_name}"
-
-    # Add text boxes for each quadrant
-    left, top, width, height = Inches(0.5), Inches(1.5), Inches(4), Inches(2.5)
-    txBox = slide.shapes.add_textbox(left, top, width, height)
-    tf = txBox.text_frame
-    tf.text = "Strengths\n" + "\n".join(swot["Strengths"])
-
-    left = Inches(5.5)
-    txBox = slide.shapes.add_textbox(left, top, width, height)
-    tf = txBox.text_frame
-    tf.text = "Weaknesses\n" + "\n".join(swot["Weaknesses"])
-
-    top = Inches(4.0)
-    left = Inches(0.5)
-    txBox = slide.shapes.add_textbox(left, top, width, height)
-    tf = txBox.text_frame
-    tf.text = "Opportunities\n" + "\n".join(swot["Opportunities"])
-
-    left = Inches(5.5)
-    txBox = slide.shapes.add_textbox(left, top, width, height)
-    tf = txBox.text_frame
-    tf.text = "Threats\n" + "\n".join(swot["Threats"])
-
-    buf = BytesIO()
-    prs.save(buf)
-    buf.seek(0)
-    return buf
-
 # ---------------- UI ----------------
 st.title("Regional Office Location Density Analysis")
 
@@ -217,9 +214,10 @@ st.markdown("""
 3. Use sidebar to adjust radius and select office for map.  
 4. See ranking table + download.  
 5. Enable contextual info.  
-6. Generate AI SWOT Analysis + export as PPT.
+6. Use AI Recommendation and SWOT Analysis.
 """)
 
+# File upload
 uploaded_file=st.file_uploader("Upload B2B Customers Excel File",type=["xlsx"])
 
 if uploaded_file:
@@ -229,6 +227,7 @@ if uploaded_file:
         st.stop()
     df["supplier_lat"],df["supplier_lon"]=zip(*df["supplier_coords"].map(parse_coords))
 
+    # Dynamic offices
     st.subheader("Enter Potential Regional Office Locations (max 6)")
     if "num_offices" not in st.session_state: st.session_state.num_offices=1
     c1,c2=st.columns([1,1])
@@ -251,7 +250,7 @@ if uploaded_file:
             sel_off_name=st.selectbox("Select office for map",[o["office_name"] for o in offices])
             enrich=st.checkbox("Fetch contextual info",value=False)
 
-        # Coverage
+        # Compute coverage
         results=[]
         for o in offices:
             cnt=0; within=[]
@@ -303,26 +302,40 @@ if uploaded_file:
             with st.spinner("Fetching info..."):
                 rg=reverse_geocode(sel_off["lat"],sel_off["lon"])
                 rail=overpass_nearest_rail_station(sel_off["lat"],sel_off["lon"])
+                air=overpass_nearest_airport(sel_off["lat"],sel_off["lon"])
                 nhs=overpass_nearby_highways(sel_off["lat"],sel_off["lon"])
-            context_info=f"Place: {rg}\nRail: {rail}\nHighways: {nhs}"
+                pop=geonames_population(rg.get("city")) or wikidata_population(rg.get("city"))
 
+            context_info = f"Place: {rg}\nRail: {rail}\nAirport: {air}\nHighways: {nhs}\nPopulation: {pop}"
+
+            st.markdown("### 📍 Reverse-geocoded Place")
             if rg:
                 st.markdown(f"**Address:** {rg['display_name']}  \n**City:** {rg.get('city','')}  "
                             f"\n**State:** {rg.get('state','')}  \n**Country:** {rg.get('country','')}")
-            if rail: st.markdown(f"🚉 **Railway Station:** {rail['name']} — {rail['distance_km']} km")
-            if nhs: st.dataframe(pd.DataFrame(nhs), use_container_width=True)
+            else: st.info("No reverse-geocode data.")
 
-        # AI SWOT
-        st.subheader("🤖 AI SWOT Analysis")
+            st.markdown("### 🚉 Nearest Railway Station")
+            if rail: st.markdown(f"**{rail['name']}** — {rail['distance_km']} km")
+            else: st.info("Not found.")
+
+            st.markdown("### ✈️ Nearest Airport")
+            if air: st.markdown(f"**{air['name']}** — {air['distance_km']} km")
+            else: st.info("No airport found.")
+
+            st.markdown("### 🛣️ Connecting National Highways")
+            if nhs: st.dataframe(pd.DataFrame(nhs), use_container_width=True)
+            else: st.info("No NH found nearby.")
+
+            st.markdown("### 🧑 Population")
+            if pop and pop.get("population"): st.markdown(f"**{pop['city']}** — {pop['population']:,}")
+            else: st.info("No population data found.")
+
+        # AI Section
+        st.subheader("🤖 AI Insights")
+        if st.button("Generate AI Recommendation"):
+            ai_text = ai_recommendation(res_df, context_info)
+            st.write(ai_text)
+
         if st.button("Generate SWOT Analysis"):
             ai_text = ai_swot_analysis(res_df, context_info, sel_off_name)
-            st.text("Raw AI Output:")
-            st.text(ai_text)
-
-            swot=parse_swot(ai_text)
-            show_swot(swot)
-
-            ppt_buf=export_swot_to_ppt(swot, sel_off_name)
-            st.download_button("📥 Download SWOT as PPT", ppt_buf,
-                               file_name=f"SWOT_{sel_off_name}.pptx",
-                               mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+            st.write(ai_text)
